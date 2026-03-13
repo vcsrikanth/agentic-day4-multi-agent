@@ -88,17 +88,13 @@ class AgentHandoff:
         )
 
 
-class MultiAgentStateRequired(TypedDict):
-    """Required keys shared across supervisor and specialist nodes."""
+class MultiAgentState(TypedDict, total=False):
+    """State shared across supervisor and specialist nodes."""
     user_request: str        # original user message
     route: str               # "orders" | "billing" | "technical" | "subscription" | "general"
     agent_used: str          # which specialist handled it
     specialist_result: str   # raw output from specialist agent
     final_response: str      # final response returned to the user
-
-
-class MultiAgentState(MultiAgentStateRequired, total=False):
-    """State shared across supervisor and specialist nodes. 5 keys required; extras optional."""
     escalated: bool          # whether the case was escalated
     level: str               # e.g. severity or priority level
     handoff: AgentHandoff    # auditable handoff from supervisor to specialist
@@ -113,6 +109,8 @@ from langgraph.prebuilt import create_react_agent
 import random
 load_dotenv()
 llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0)
+# Slightly warmer for synthesis—helps responses feel more natural and conversational
+llm_friendly = ChatOpenAI(model="gpt-4.1-nano", temperature=0.5)
 
 # Injection detection at graph entry
 INJECTION_PATTERNS: Final[list[str]] = [
@@ -134,7 +132,7 @@ def detect_injection(user_input: str) -> bool:
 
 def guard_request(user_input: str) -> str:
     if detect_injection(user_input):
-        return "I can only assist with account and order support. (Request blocked.)"
+        return "Hey, I'd love to help, but I can only assist with account and order support. Is there something I can help you with there?"
     return user_input
 
 
@@ -280,12 +278,41 @@ def general_agent_node(state: MultiAgentState) -> dict:
     return _run_specialist(_general_agent, state, "general")
 
 
+REFLECTION_SYSTEM_PROMPT = """You refine customer support responses to sound friendly and natural, like a real person helping out.
+
+Rules:
+- Be warm and conversational—write like you're talking to a friend, not a formal letter
+- Use natural phrasing: "Hey, good news!" or "I totally get that—here's what I found" instead of stiff corporate language
+- Lead with the answer or outcome; add context after if needed
+- Keep it concise but not robotic—a little personality is welcome
+- Preserve all factual content (IDs, statuses, next steps)
+- Show empathy when things go wrong (e.g., "Sorry to hear that" or "That's frustrating")
+- Output ONLY the refined response, no meta-commentary"""
+
+
 def synthesize_response_node(state: MultiAgentState) -> dict:
-    """Synthesize the specialist result into a final user-facing response."""
+    """Synthesize the specialist result into a final user-facing response, with reflection to sharpen it."""
     result = state.get("specialist_result", "")
     agent = state.get("agent_used", "general")
-    # Optionally refine with LLM; for now pass through
-    final = result if result else "I'm sorry, I couldn't process your request."
+    user_request = state.get("user_request", "")
+
+    if not result:
+        return {"final_response": "Oops, I ran into a snag and couldn't quite get that. Could you try again or rephrase your question? I'm here to help!"}
+
+    # Reflection pass: sharpen the response
+    messages = [
+        SystemMessage(content=REFLECTION_SYSTEM_PROMPT),
+        HumanMessage(
+            content=f"Original request: {user_request}\n\nSpecialist response to refine:\n{result}"
+        ),
+    ]
+    refined = llm_friendly.invoke(messages)
+    final = (refined.content or result).strip()
+
+    tokens_in, tokens_out = _mock_tokens(result, final)
+    if audit := state.get("audit_log"):
+        audit.log("synthesize_response", "reflection", tokens_in, tokens_out)
+
     return {"final_response": final}
 
 
